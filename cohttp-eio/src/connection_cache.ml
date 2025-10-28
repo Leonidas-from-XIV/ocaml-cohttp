@@ -63,7 +63,9 @@ end = struct
       Eio.Buf_write.with_flow socket @@ fun output ->
       let loop () =
         match Eio.Stream.take request_stream with
-        | None -> () (* Stream "closed", so we terminate *)
+        | None ->
+            (* Stream "closed", so we terminate *)
+            ()
         | Some { request; body; resolver } -> (
             let () =
               Io.Request.write ~flush:false
@@ -204,9 +206,119 @@ module Cache = struct
         Connection.call ~headers ~body ~chunked ~absolute_form meth uri conn
 end
 
-module Proxy = struct
-  type t = unit
+module StringSet = Set.Make (String)
 
-  let create ?keep:_ ?retry:_ ?parallel:_ ?depth:_ = raise (Failure "TODO")
-  let call () = raise (Failure "TODO")
+let tunnel_schemes = StringSet.of_list [ "https" ]
+
+module No_proxy = struct
+  type pattern = Name of string | Ipaddr_prefix of Ipaddr.Prefix.t
+  type t = Wildcard | Patterns of pattern list
+
+  let trim_dots ~first_leading s =
+    let segments = String.split_on_char '.' s in
+    let segments =
+      match (first_leading, segments) with
+      | false, segments -> segments
+      | true, "" :: segments ->
+          (* drop first . if first_leading *)
+          segments
+      | true, segments -> segments
+    in
+    segments
+    |> List.fold_left
+         (fun (head, tail) e ->
+           match e with
+           | "" as e ->
+               (* collect in tail *)
+               (head, e :: tail)
+           | content ->
+               (* we got something thats not empty, append tail to head clear tail *)
+               (content :: (tail @ head), []))
+         ([], [])
+    |> fst
+    |> List.rev
+    |> String.concat "."
+
+  let parse_pattern pattern =
+    match Ipaddr.of_string pattern with
+    | Ok addr -> Ipaddr_prefix (Ipaddr.Prefix.of_addr addr)
+    | Error _ -> (
+        match Ipaddr.Prefix.of_string pattern with
+        | Ok prefix -> Ipaddr_prefix prefix
+        | Error _ -> Name (trim_dots ~first_leading:true pattern))
+
+  let parse_definition s =
+    match s with
+    | "*" -> Wildcard
+    | s ->
+        let patterns =
+          s
+          |> String.split_on_char ','
+          |> List.filter_map (function
+               | "" -> None
+               | pattern -> Some (String.trim pattern))
+          |> List.map parse_pattern
+        in
+        Patterns patterns
+
+  let parse = function
+    | None -> Patterns []
+    | Some definition -> parse_definition definition
+end
+
+module Proxy = struct
+  (* TODO: different types of proxies *)
+  module Direct = Cache
+  module Tunnel = No_cache
+
+  type proxy = Direct of Direct.t | Tunnel of Tunnel.t
+
+  type t = {
+    proxies : (string * proxy) list;
+    no_proxy : Direct.t;
+    no_proxy_patterns : No_proxy.t;
+    direct : proxy option;
+    tunnel : proxy option;
+  }
+
+  let create ?keep ?retry ?parallel ?depth ?(scheme_proxy = []) ?all_proxy:_
+      ?no_proxy ?proxy_headers:_ ~net:_ () =
+    let create_default () = Direct.create ?keep ?retry ?parallel ?depth () in
+    let no_proxy_patterns = No_proxy.parse no_proxy in
+    let no_proxy = create_default () in
+
+    let proxies =
+      List.map
+        (fun (scheme, _uri) ->
+          match StringSet.mem scheme tunnel_schemes with
+          | true ->
+              let tunnel = Tunnel.create () in
+              (scheme, Tunnel tunnel)
+          | false ->
+              let direct = no_proxy in
+              (scheme, Direct direct))
+        scheme_proxy
+    in
+    let direct = None in
+    let tunnel = None in
+    { proxies; no_proxy; direct; tunnel; no_proxy_patterns }
+
+  let call (t : t) : S.cache_call =
+   fun _t ~sw:_ ?headers:_ ?body:_ ?(chunked = false) ?absolute_form:_ _meth
+       uri ->
+    let scheme = Option.value ~default:"" (Uri.scheme uri) in
+    let proxy =
+      match List.assoc scheme t.proxies with
+      | proxy -> Some proxy
+      | exception Not_found -> (
+          match StringSet.mem scheme tunnel_schemes with
+          | true -> t.tunnel
+          | false -> t.direct)
+    in
+    match proxy with
+    | None ->
+        failwith "noproxy"
+        (* No_cache.call t.no_proxy ?headers ?body ?absolute_form meth uri *)
+    | Some (Direct proxy) -> failwith "Todo direct"
+    | Some (Tunnel proxy) -> failwith "TODO tunnel"
 end
