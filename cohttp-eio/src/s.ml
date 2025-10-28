@@ -36,7 +36,7 @@ type cache_call =
       processed by the remote endpoint and should be retried. But beware that a
       [`Stream] [body] may have been consumed. *)
 
-(** A [Connection_cache] handles http requests. It not necessarily caches
+(** A [Connection_cache] handles http requests, and does not necessarily caches
     connections. *)
 module type Connection_cache = sig
   type t

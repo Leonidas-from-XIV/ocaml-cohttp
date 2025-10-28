@@ -5,11 +5,23 @@ module Connection : sig
   type t
 
   val create : ?limit:int -> sw:Eio.Switch.t -> S.connection -> t
-  (** TODO(doc): Create a new connection *)
+  (** [create ~sw socket] is a new managed connection for the [socket] backed by
+      a forked process attached to [sw].
+
+      The process will be suspended unless it has messages pending in its queue
+      from {!val:call}.
+
+      Connections should be terminated when they are no longer needed via
+      {!val:close}.
+
+      @param limit
+        set the max limit of the connection's message input stream. When the
+        input stream is full, attempts to add to the queue will block until
+        capacity if freed up. Default: [max_int] *)
 
   val close : t -> unit
-  (** TODO(doc): Close the connection *)
 
+  (* TODO Remove if not needed *)
   (* val send : ?body:Body.t -> request:Http.Request.t -> t -> (Http.Response.t * Body.t) *)
   (** TODO(doc): Send a request and wait for the response *)
 
@@ -22,25 +34,30 @@ module Connection : sig
     Uri.t ->
     t ->
     Http.Response.t * Body.t
-  (** TODO(doc): Form and send a request, and wait for the response *)
+
+  (** [call ~headers ~body ~chunked ~aboslute_form meth uri conn] sends a new
+      request via the connection [conn], blocking until the response is
+      received. *)
 end = struct
+  (* The internal representation of a message to sent to the connection process *)
   type req = {
     body : Body.t option;
     request : Http.Request.t;
     resolver : (Http.Response.t * Body.t) Eio.Promise.u;
   }
 
-  (* A connection is a forked process that reads from a stream of messages.
-     its principle type a function that lets users send messages along the stream.  *)
+  (* Internally, a connection is a forked process that reads from an
+     asynchronous stream of messages.
+
+     Values of its principle type are functions for sending messages along the
+     stream. The message [None] closes the connection. *)
   type t = req option -> unit
 
-  (** TODO: Doc
-
-      - Send [None] to terminate the process *)
   let create ?(limit = max_int) ~sw socket : t =
     let request_stream : req option Eio.Stream.t = Eio.Stream.create limit in
-    (* By giving constructors a send function, we provide a write-only stream, 
-       making it impossible for other parts of the program to steal from our stream *)
+    (* By giving constructors this send function, we provide a write-only
+       stream,  making it impossible for other parts of the program to steal
+       messages from the stream. *)
     let send_request req = Eio.Stream.add request_stream req in
     let consume () =
       Eio.Buf_write.with_flow socket @@ fun output ->
@@ -128,35 +145,48 @@ module No_cache = struct
 end
 
 module Cache = struct
-  module Tbl (* TODO: Seal with interface *) = struct
+  (* A thread-safe mutable hashtable for caching connections *)
+  module Tbl : sig
+    type t
+    type key = Eio.Net.Sockaddr.stream
+    type value = Connection.t
+
+    val create : unit -> t
+    val get : key -> t -> value option
+    val add : key -> value -> t -> unit
+  end = struct
+    type key = Eio.Net.Sockaddr.stream
+    type value = Connection.t
+
     type t = {
-      (* We only cache for [stream] sockets, because we only care for what we can connect to via [Eio.Net.connect] *)
-      hashtbl : (Eio.Net.Sockaddr.stream, Connection.t) Hashtbl.t;
+      (* We only cache for [stream] sockets, because we only care for what
+         we can connect to via [Eio.Net.connect] *)
+      hashtbl : (key, value) Hashtbl.t;
       mutex : Eio.Mutex.t;
     }
+
+    let create () =
+      {
+        hashtbl = Hashtbl.create 10 (* TODO What is the right number here? *);
+        mutex = Eio.Mutex.create ();
+      }
 
     let get k (t : t) =
       Eio.Mutex.use_ro t.mutex (fun () -> Hashtbl.find_opt t.hashtbl k)
 
     let add k v (t : t) =
-      Eio.Mutex.use_rw (* TODO Should we protect or not? *)
-        ~protect:true t.mutex (fun () ->
-          (* TODO Should we `add`, expecting to add multiple connections to the same endpoint? *)
+      (*  [protect] tells Eio to ensure the critical section cannot be canceled.
+          But canceling adding a connection to the cache is fine in our case, nothing
+          bad would come of it. *)
+      let protect = false in
+      Eio.Mutex.use_rw ~protect t.mutex (fun () ->
+          (* We use [replace] over [add] because the latter supports adding
+             multiple  values for a key, but we don't currently support caching
+             multiple connections for the same endpoint.  *)
           Hashtbl.replace t.hashtbl k v)
-
-    let create () =
-      {
-        hashtbl = Hashtbl.create 10 (* What is the right number here? *);
-        mutex = Eio.Mutex.create ();
-      }
   end
 
   type t = { cache : Tbl.t }
-
-  (* let get_connection t endpoint = *)
-  (*   match lookup_in_map endpoint with *)
-  (*   | Some c -> c *)
-  (*   | None _ -> add_to_mapp endpoint *)
 
   let create ?keep:_TODO ?retry:_TODO ?parallel:_TODO ?depth:_TODO ?proxy:_TODO
       () =
